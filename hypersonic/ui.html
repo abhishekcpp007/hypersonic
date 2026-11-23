@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Hypersonic</title>
+<script>
+  // runs before anything is loaded from elsewhere, so the token leaves the address bar even if a later script fails
+  try {
+    const first = new URLSearchParams(location.search);
+    for (const name of ['token', 'cwd']) if (first.get(name)) sessionStorage.setItem(name, first.get(name));
+    history.replaceState(null, '', location.pathname);
+  } catch (e) {}
+</script>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config = { darkMode: 'class' }</script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<style>
+  html,body{background:#0b0e14;color:#e6edf3}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#2a313c;border-radius:6px}
+  .md{line-height:1.6;overflow-wrap:anywhere}
+  .md>*:first-child{margin-top:0}.md>*:last-child{margin-bottom:0}
+  .md p,.md ul,.md ol,.md pre,.md table,.md blockquote{margin:.6em 0}
+  .md h1,.md h2,.md h3,.md h4{font-weight:600;margin:1em 0 .4em}
+  .md h1{font-size:1.25em}.md h2{font-size:1.15em}.md h3{font-size:1.05em}
+  .md ul{list-style:disc;padding-left:1.4em}.md ol{list-style:decimal;padding-left:1.4em}
+  .md li{margin:.15em 0}
+  .md a{color:#38bdf8;text-decoration:underline}
+  .md code{background:#0b0e14;border:1px solid #27272a;border-radius:4px;padding:.05em .35em;font-size:.88em}
+  .md pre{position:relative;background:#0b0e14;border:1px solid #27272a;border-radius:8px;padding:.7em .9em;overflow:auto}
+  .md pre code{background:none;border:0;padding:0;font-size:.85em}
+  .md table{border-collapse:collapse;display:block;overflow:auto}
+  .md th,.md td{border:1px solid #27272a;padding:.3em .65em;text-align:left}
+  .md th{background:#11151c;font-weight:600}
+  .md blockquote{border-left:3px solid #3f3f46;padding-left:.8em;color:#a1a1aa}
+  .md hr{border-color:#27272a;margin:1em 0}
+  .copy{position:absolute;top:6px;right:6px;font:11px ui-sans-serif,system-ui;color:#a1a1aa;background:#18181b;border:1px solid #3f3f46;border-radius:5px;padding:1px 7px;cursor:pointer;opacity:0}
+  .md pre:hover .copy{opacity:1}
+</style>
+</head>
+<body class="bg-[#0b0e14]">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+const qs = new URLSearchParams(location.search);
+// the address bar loses the token below, so a reload reads both values back from this tab's storage
+const kept = (name) => {
+  try {
+    if (qs.get(name)) sessionStorage.setItem(name, qs.get(name));
+    return sessionStorage.getItem(name) || '';
+  } catch (e) { return qs.get(name) || ''; }
+};
+const TOKEN = kept('token');
+const CWD = kept('cwd');
+const stored = { get: (name) => { try { return sessionStorage.getItem(name) || ''; } catch (e) { return ''; } },
+                 set: (name, value) => { try { sessionStorage.setItem(name, value); } catch (e) {} } };
+const H = { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' };
+const MODEL_LEAD = '/model ';
+const CHARS_PER_TOKEN = 4;
+const WARN_SHARE = 0.6, FULL_SHARE = 0.85;
+const THINKING = 'thinking', WRITING = 'writing', ASKING = 'waiting for your answer';
+const NEAR_BOTTOM = 200;
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const GONE = 'The server restarted or closed this chat. Run `hypersonic web` again to open a fresh page.';
+// keep the bearer token out of browser history and any later referrer header
+try { history.replaceState(null, '', location.pathname); } catch (e) {}
+
+const modelLabel = (picked, answered) => !answered || picked.endsWith(answered) ? picked : picked + ' (' + answered + ')';
+const short = (count) => {
+  for (const [size, unit] of [[1e6, 'M'], [1e3, 'k']]) if (count >= size) return (count / size).toFixed(1).replace(/\.0$/, '') + unit;
+  return String(count);
+};
+
+// Replies are rendered as formatted text. Only plain formatting tags survive, so a reply can never run a
+// script or load a remote image (an image address could be used to leak the conversation).
+const SAFE = {
+  ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'del', 'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
+  ALLOWED_ATTR: ['href', 'title'],
+};
+const canFormat = Boolean(window.marked && window.DOMPurify);
+if (canFormat) DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  if (node.tagName === 'A') { node.setAttribute('target', '_blank'); node.setAttribute('rel', 'noopener noreferrer'); }
+});
+const toHtml = (text) => DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }), SAFE);
+
+// a saved conversation, turned into the same rows a live one produces
+function fromHistory(items) {
+  const rows = [];
+  for (const entry of items) {
+    if (entry.role === 'tool') {
+      let last = rows[rows.length - 1];
+      if (!last || last.kind !== 'assistant') { last = { kind: 'assistant', text: '', tools: [] }; rows.push(last); }
+      last.tools.push({ id: entry.id, name: entry.name, input: entry.input, status: entry.ok === null ? 'run' : entry.ok ? 'ok' : 'err', seconds: null, preview: entry.preview });
+    } else if (entry.role === 'user' || entry.role === 'assistant') rows.push({ kind: entry.role, text: entry.text, tools: [] });
+    else rows.push({ kind: 'notice', text: entry.text, error: entry.role === 'error' });
+  }
+  return rows;
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({ headers: H }, opts));
+  if (!res.ok) throw new Error(res.status + ': ' + await res.text());
+  return res.status === 204 ? null : res.json();
+}
+
+function summarize(name, input) {
+  if (!input) return '';
+  // a model can send anything here, so every value is turned into text first
+  if (name === 'shell') return String(input.command ?? '').split('\n')[0];
+  if (name === 'files') return (String(input.command ?? '') + ' ' + String(input.path ?? '')).trim();
+  if (name === 'search' || name === 'web') return String(input.query || input.url || '');
+  return '';
+}
+
+function Formatted({ text, done }) {
+  const box = useRef(null);
+  const html = useMemo(() => canFormat ? toHtml(text) : null, [text]);
+  useEffect(() => {
+    if (!done || !box.current) return;
+    for (const pre of box.current.querySelectorAll('pre')) {
+      if (pre.querySelector('.copy')) continue;
+      const button = document.createElement('button');
+      button.className = 'copy'; button.textContent = 'copy';
+      button.onclick = () => {
+        navigator.clipboard.writeText((pre.querySelector('code') || pre).innerText);
+        button.textContent = 'copied'; setTimeout(() => { button.textContent = 'copy'; }, 1200);
+      };
+      pre.appendChild(button);
+    }
+  }, [html, done]);
+  if (html === null) return <div className="whitespace-pre-wrap break-words">{text}</div>;
+  return <div ref={box} className="md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function Dot({ status }) {
+  const c = status === 'ok' ? 'bg-emerald-500' : status === 'err' ? 'bg-red-500' : 'bg-sky-400 animate-pulse';
+  return <span className={'inline-block w-2 h-2 rounded-full flex-none ' + c} />;
+}
+
+function ToolCard({ tool }) {
+  const [opened, setOpened] = useState(null);
+  const failed = tool.status === 'err';
+  const open = opened === null ? failed : opened;
+  return (
+    <div className={'my-2 rounded-lg border overflow-hidden bg-[#0f141b] ' + (failed ? 'border-red-900/70' : 'border-zinc-800')}>
+      <button onClick={() => setOpened(!open)} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-zinc-900/60">
+        <Dot status={tool.status} />
+        <span className="font-semibold text-sky-400">{tool.name}</span>
+        <span className="text-zinc-400 truncate font-mono text-[13px]">{summarize(tool.name, tool.input)}</span>
+        <span className="ml-auto flex-none text-zinc-500 text-xs">{tool.status === 'run' ? 'running…' : tool.seconds === null ? '' : tool.seconds + 's'}</span>
+        <span className="flex-none text-zinc-600 text-xs">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-zinc-800 text-xs">
+          <pre className="m-0 px-3 py-2 overflow-auto text-zinc-400 max-h-48">{JSON.stringify(tool.input, null, 2)}</pre>
+          {tool.preview && <pre className={'m-0 px-3 py-2 border-t border-zinc-800 overflow-auto max-h-48 whitespace-pre-wrap ' + (failed ? 'text-red-300' : 'text-zinc-300')}>{tool.preview}</pre>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Attachments({ items }) {
+  if (!items || !items.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2 mt-2">
+      {items.map((a, i) => a.isImage
+        ? <img key={i} src={'data:' + a.media_type + ';base64,' + a.data} className="max-h-28 rounded-lg border border-zinc-700" />
+        : <span key={i} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-zinc-800 border border-zinc-700 text-sm">📄 {a.name}</span>)}
+    </div>
+  );
+}
+
+function RowBody({ item, onDecide, onResume }) {
+  if (item.kind === 'notice') return <div className={'py-1.5 sm:pl-[4.6rem] whitespace-pre-wrap ' + (item.error ? 'text-sm text-red-400' : item.quiet ? 'text-xs text-zinc-600' : 'text-sm text-zinc-400')}>{item.text}</div>;
+  if (item.kind === 'sessions') return (
+    <div className="my-3">
+      <div className="text-zinc-400 text-sm mb-2">Recent sessions. Click one to resume it:</div>
+      {item.list.length === 0 ? <div className="text-zinc-500 text-sm pl-1">none yet</div> :
+        item.list.map(s => (
+          <div key={s.id} onClick={() => onResume(s.id)}
+            className="flex items-baseline gap-3 px-3 py-2 rounded-lg border border-zinc-800 mb-1.5 cursor-pointer hover:border-sky-600 hover:bg-zinc-800/40">
+            <span className="text-sky-400 font-mono text-xs flex-none">{s.id.slice(0, 8)}</span>
+            <span className="text-zinc-200 text-sm truncate flex-1">{s.preview || '(no messages)'}</span>
+            <span className="text-zinc-500 text-xs flex-none">{s.messages} msgs · {(s.cwd || '').split('/').pop()}</span>
+          </div>
+        ))}
+    </div>
+  );
+  if (item.kind === 'perm') return (
+    <div className="my-2 rounded-lg border border-amber-700/70 bg-amber-950/30 px-3 py-2.5">
+      <div className="text-sm mb-1.5">Allow <b className="text-amber-300">{item.name}</b> to run this?</div>
+      <pre className="m-0 mb-2 bg-black px-2 py-1.5 rounded text-zinc-100 text-[13px] whitespace-pre-wrap break-words max-h-60 overflow-auto">{item.name === 'shell' ? String((item.input || {}).command ?? '') : summarize(item.name, item.input)}</pre>
+      {item.decided
+        ? <span className={item.decided === 'allow' ? 'text-emerald-400' : item.decided === 'deny' ? 'text-red-400' : 'text-zinc-500'}>
+            {item.decided === 'allow' ? '✓ allowed' : item.decided === 'deny' ? '✗ denied' : 'not answered, the turn ended'}</span>
+        : <div className="flex gap-2">
+            <button onClick={() => onDecide(item.id, true)} className="px-3 py-1 rounded-md text-sm bg-emerald-900/50 border border-emerald-700 text-emerald-300 hover:bg-emerald-900">Allow</button>
+            <button onClick={() => onDecide(item.id, false)} className="px-3 py-1 rounded-md text-sm bg-red-900/40 border border-red-800 text-red-300 hover:bg-red-900/70">Deny</button>
+          </div>}
+    </div>
+  );
+  const mine = item.kind === 'user';
+  return (
+    <div className="my-3.5 flex gap-2.5">
+      <div className="hidden sm:block w-16 flex-none pt-2.5 text-xs uppercase tracking-wide text-zinc-500">{mine ? 'You' : 'Hyper'}</div>
+      <div className="flex-1 min-w-0">
+        {item.text ? (
+          <div className={'rounded-xl border px-3.5 py-2.5 ' + (mine ? 'bg-sky-950/40 border-sky-900 whitespace-pre-wrap break-words' : 'bg-[#161b22] border-zinc-800')}>
+            {mine ? item.text : <Formatted text={item.text} done={!item.streaming} />}
+          </div>
+        ) : null}
+        <Attachments items={item.attachments} />
+        {(item.tools || []).map((t, i) => <ToolCard key={i} tool={t} />)}
+      </div>
+    </div>
+  );
+}
+// rows are edited in place while a reply streams in, so a row redraws only when its version number changes
+const Row = React.memo(RowBody, (before, after) => before.item === after.item && before.version === after.version);
+
+function Meter({ usage }) {
+  if (!usage) return null;
+  const used = usage.prompt || 0, limit = usage.limit || 0;
+  const share = limit ? Math.min(1, used / limit) : 0;
+  const colour = share >= FULL_SHARE ? 'bg-red-500' : share >= WARN_SHARE ? 'bg-amber-400' : 'bg-emerald-500';
+  const cached = used ? Math.round(100 * (usage.cache_read || 0) / used) : 0;
+  return (
+    <div className="flex items-center gap-3 text-xs text-zinc-400 flex-none" title="When the context reaches its limit, the chat is condensed into a short note and continues.">
+      <div className="flex items-center gap-2">
+        <span>context</span>
+        <div className="w-24 h-1.5 rounded bg-zinc-800 overflow-hidden"><div className={colour} style={{ width: (share * 100) + '%', height: '100%' }} /></div>
+        <span><b className="text-zinc-200">{short(used)}</b>{limit ? ' / ' + short(limit) : ''}</span>
+        {limit ? <span className="text-zinc-300">{short(Math.max(0, limit - used))} left</span> : null}
+      </div>
+      <span className="hidden lg:inline">session <b className="text-zinc-200">{short(usage.spent || 0)}</b> · {usage.steps || 0} steps · cache {cached}%</span>
+    </div>
+  );
+}
+
+function Activity({ work, onStop }) {
+  const [, setNow] = useState(0);
+  useEffect(() => { const timer = setInterval(() => setNow(n => n + 1), 500); return () => clearInterval(timer); }, []);
+  const seconds = Math.floor((Date.now() - work.since) / 1000);
+  return (
+    <div className="max-w-3xl mx-auto mb-2 flex items-center gap-2.5 px-1 text-[13px] text-sky-300">
+      <span className="w-3.5 h-3.5 flex-none rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
+      <span className="truncate font-mono">{work.doing}</span>
+      <span className="flex-none text-zinc-400">{seconds}s{work.typed ? ' · ~' + short(Math.floor(work.typed / CHARS_PER_TOKEN)) + ' tokens out' : ''}</span>
+      <span className="flex-1" />
+      <button onClick={onStop} className="flex-none px-2.5 py-0.5 rounded-md border border-zinc-700 bg-zinc-800 text-zinc-200 hover:border-red-500 hover:text-red-300">Stop (esc)</button>
+    </div>
+  );
+}
+
+function App() {
+  const [where, setWhere] = useState({ cwd: '', model: '', answered: '', rag: false });
+  const [feed, setFeed] = useState([]);
+  const [usage, setUsage] = useState(null);
+  const [text, setText] = useState('');
+  const [attachments, setAttachments] = useState([]);
+  const [work, setWork] = useState(null);
+  const [ready, setReady] = useState(false);
+  const [connError, setConnError] = useState(null);
+  const [commands, setCommands] = useState([]);
+  const [models, setModels] = useState([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [menuIndex, setMenuIndex] = useState(null);
+  const [menuOff, setMenuOff] = useState(false);
+  const model = useRef('');
+  const sid = useRef(null);
+  const feedRef = useRef([]);
+  const gen = useRef(0);
+  const frame = useRef(0);
+  const turn = useRef({ steps: 0, used: 0, out: 0, since: 0 });
+  const taRef = useRef(null);
+  const endRef = useRef(null);
+  const pinned = useRef(true);
+  const busy = work !== null;
+
+  // many small pieces of text arrive per second, so the screen is redrawn once per animation frame
+  const commit = () => {
+    if (frame.current) return;
+    frame.current = requestAnimationFrame(() => { frame.current = 0; setFeed(feedRef.current.slice()); });
+  };
+  const touch = (item) => { item.version = (item.version || 0) + 1; commit(); };
+  const push = (item) => { feedRef.current.push(item); commit(); };
+  const lastAssistant = () => {
+    const f = feedRef.current;
+    let a = f[f.length - 1];
+    if (!a || a.kind !== 'assistant' || !a.streaming) { a = { kind: 'assistant', text: '', tools: [], streaming: true }; f.push(a); }
+    return a;
+  };
+  const doing = (label) => setWork(w => w ? { ...w, doing: label } : { doing: label, since: Date.now(), typed: 0 });
+
+  // the view follows new text only while the reader is at the bottom; scrolling up to read lets go of it
+  useEffect(() => {
+    const onScroll = () => { pinned.current = window.innerHeight + window.scrollY >= document.body.offsetHeight - NEAR_BOTTOM; };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+  useEffect(() => { if (pinned.current && endRef.current) endRef.current.scrollIntoView(); });
+
+  const handle = useCallback((ev) => {
+    switch (ev.type) {
+      case 'turn.start': turn.current = { steps: 0, used: 0, out: 0, since: Date.now() }; doing(THINKING); break;
+      case 'text': {
+        let a = lastAssistant();
+        if (a.tools.length) { a.streaming = false; touch(a); a = lastAssistant(); }  // words after a tool call start a new block, so the order on screen is the order it happened
+        a.text += ev.delta; touch(a);
+        setWork(w => w ? { ...w, doing: WRITING, typed: w.typed + ev.delta.length } : w); break;
+      }
+      case 'tool.call': {
+        const a = lastAssistant(); a.tools.push({ id: ev.id, name: ev.name, input: ev.input, status: 'run' }); touch(a);
+        doing(ev.name + '  ' + summarize(ev.name, ev.input)); break;
+      }
+      case 'tool.result': {
+        // some models reuse ids, so only the newest card still running with this id takes the result
+        const cards = feedRef.current.flatMap(it => (it.tools || []).map(t => [it, t])).reverse();
+        const hit = cards.find(([, t]) => t.id === ev.id && t.status === 'run');
+        if (hit) { Object.assign(hit[1], { status: ev.ok ? 'ok' : 'err', seconds: ev.seconds || 0, preview: ev.preview || '' }); touch(hit[0]); }
+        doing(feedRef.current.some(it => it.kind === 'perm' && !it.decided) ? ASKING : THINKING); break;
+      }
+      case 'permission.request': push({ kind: 'perm', id: ev.id, name: ev.name, input: ev.input, decided: null }); doing(ASKING); break;
+      case 'usage': {
+        const t = turn.current;
+        turn.current = { ...t, steps: t.steps + 1, used: t.used + (ev.prompt || 0), out: t.out + (ev.output || 0) };
+        setUsage(ev); setWhere(w => ({ ...w, answered: ev.model || '' })); break;
+      }
+      case 'model': model.current = ev.name; setWhere(w => ({ ...w, model: ev.name, answered: '' })); break;
+      case 'rag': setWhere(w => ({ ...w, rag: ev.on })); break;
+      case 'notice': push({ kind: 'notice', text: ev.text, error: ev.error }); break;
+      case 'error': push({ kind: 'notice', text: ev.message, error: true }); break;
+      case 'compaction': push({ kind: 'notice', text: 'the chat was condensed to keep the context small' }); break;
+      case 'turn.end': {
+        // nothing can still be running or waiting once the turn is over
+        for (const it of feedRef.current) {
+          if (it.kind === 'assistant' && it.streaming) { it.streaming = false; touch(it); }
+          if (it.kind === 'perm' && !it.decided) { it.decided = 'void'; touch(it); }
+          for (const t of (it.tools || [])) if (t.status === 'run') { Object.assign(t, { status: 'err', seconds: 0, preview: 'interrupted' }); touch(it); }
+        }
+        const t = turn.current;
+        if (ev.stop === 'aborted') push({ kind: 'notice', text: 'stopped' });
+        else if (t.steps && t.since) {
+          const ended = ev.stop === 'end' ? '✓' : `✗ ended early (${ev.stop}) ·`;
+          push({ kind: 'notice', quiet: true, text: `${ended} ${Math.round((Date.now() - t.since) / 1000)}s · ${t.steps} steps · ${short(t.used)} tokens in · ${short(t.out)} out` });
+        }
+        turn.current = { steps: 0, used: 0, out: 0, since: 0 };
+        setWork(null); break;
+      }
+    }
+  }, []);
+
+  const listen = useCallback(async (myGen, after) => {
+    while (gen.current === myGen) {
+      const ctrl = new AbortController();
+      try {
+        const res = await fetch(`/session/${sid.current}/events?after=${after}`, { headers: H, signal: ctrl.signal });
+        if (res.status === 401 || res.status === 404) {
+          // trying again can't help: this page's access or its chat is gone
+          if (gen.current === myGen) { setWork(null); setConnError(GONE); }
+          return;
+        }
+        const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+        while (gen.current === myGen) {
+          const { value, done } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const part = buf.slice(0, i); buf = buf.slice(i + 2);
+            const dl = part.split('\n').find(l => l.startsWith('data: '));
+            if (dl) { const e = JSON.parse(dl.slice(6)); after = e.seq; if (gen.current === myGen) handle(e); }
+          }
+        }
+      } catch (e) { /* reconnect */ }
+      finally { ctrl.abort(); }  // drop the old HTTP stream when this generation ends
+      if (gen.current === myGen) await new Promise(r => setTimeout(r, 600));
+    }
+  }, [handle]);
+
+  const startSession = useCallback(async (resumeId, saved) => {
+    // the chat on screen is left alone until the new one has really opened
+    const myGen = gen.current + 1;
+    setConnError(null);
+    let s, past;
+    try {
+      const body = { cwd: CWD, mode: 'ask' };
+      if (resumeId) body.resume = resumeId;
+      if (model.current) body.model = model.current;
+      s = await api('/session', { method: 'POST', body: JSON.stringify(body) });
+      past = resumeId ? await api(`/session/${s.id}/history`) : { items: [], seq: 0, busy: false, rag: false };
+    } catch (e) {
+      if (gen.current + 1 !== myGen) return;
+      // the chat saved by this tab is gone (for example its folder was removed), so open a fresh one instead of an error
+      if (saved && String(e.message).startsWith('400')) { stored.set('sid', ''); return startSession(null); }
+      if (sid.current) push({ kind: 'notice', text: e.message, error: true }); else setConnError(e.message);
+      return;
+    }
+    // another start finished while this one was waiting
+    if (gen.current + 1 !== myGen) return;
+    gen.current = myGen;
+    setWork(null); setUsage(null);
+    model.current = s.model;
+    setWhere({ cwd: s.cwd, model: s.model, answered: '', rag: past.rag });
+    feedRef.current = fromHistory(past.items);
+    if (resumeId && s.notice) feedRef.current.push({ kind: 'notice', text: s.notice, error: true });
+    commit();
+    pinned.current = true;
+    sid.current = s.id; stored.set('sid', s.id); setReady(true); listen(myGen, past.seq);
+    if (past.busy) { turn.current = { ...turn.current, since: Date.now() }; doing('working'); }
+    if (taRef.current) taRef.current.focus();
+    api(`/session/${s.id}/commands`).then(setCommands).catch(() => {});
+  }, [listen]);
+
+  // a reload comes back to the same conversation
+  useEffect(() => { startSession(stored.get('sid') || null, true); }, []);
+
+  const showSessions = async () => {
+    try { push({ kind: 'sessions', list: await api('/sessions') }); }
+    catch (e) { push({ kind: 'notice', text: e.message, error: true }); }
+  };
+
+  const decide = async (id, allow) => {
+    for (const it of feedRef.current) if (it.kind === 'perm' && it.id === id) { it.decided = allow ? 'allow' : 'deny'; touch(it); }
+    doing(THINKING);
+    try { await api(`/session/${sid.current}/permission`, { method: 'POST', body: JSON.stringify({ id, allow }) }); } catch (e) {}
+  };
+
+  const stop = () => { api(`/session/${sid.current}/abort`, { method: 'POST' }).catch(() => {}); };
+  useEffect(() => {
+    if (!busy) return;
+    const onEscape = (e) => { if (e.key === 'Escape' && e.target !== taRef.current) stop(); };
+    window.addEventListener('keydown', onEscape);
+    return () => window.removeEventListener('keydown', onEscape);
+  }, [busy]);
+
+  const addFiles = (files) => {
+    for (const f of files) {
+      const reader = new FileReader();
+      reader.onload = () => setAttachments(a => [...a, {
+        name: f.name, media_type: f.type || 'application/octet-stream',
+        data: reader.result.split(',')[1], isImage: IMAGE_TYPES.includes(f.type)
+      }]);
+      reader.readAsDataURL(f);
+    }
+  };
+
+  const send = async (picked) => {
+    const t = (typeof picked === 'string' ? picked : text).trim();
+    if ((!t && attachments.length === 0) || busy || !sid.current) return;
+    if (t.startsWith('/')) {
+      const [cmd, ...rest] = t.slice(1).split(' ');
+      const arg = rest.join(' ').trim();
+      if (cmd === 'new' || cmd === 'clear') { setText(''); startSession(null); return; }
+      if (cmd === 'resume') { setText(''); arg ? startSession(arg) : showSessions(); return; }
+      if (cmd === 'exit') { setText(''); return; }
+    }
+    doing('sending');
+    // read once: a slow upload must not let the message land in a chat opened meanwhile
+    const id = sid.current;
+    pinned.current = true;
+    const mine = attachments.slice();
+    push({ kind: 'user', text: t || null, attachments: mine });
+    setText(''); setAttachments([]);
+    if (taRef.current) taRef.current.style.height = 'auto';
+    window.scrollTo(0, document.body.scrollHeight);
+    try {
+      const ids = [];
+      for (const a of mine) {
+        const r = await api(`/session/${id}/upload`, { method: 'POST', body: JSON.stringify({ name: a.name, media_type: a.media_type, data: a.data }) });
+        ids.push(r.id);
+      }
+      await api(`/session/${id}/message`, { method: 'POST', body: JSON.stringify({ text: t || '(see attachment)', attachments: ids }) });
+    } catch (e) { push({ kind: 'notice', text: e.message, error: true }); setWork(null); }
+  };
+  // a command from a button, which leaves a half-written message and its attachments where they are
+  const command = (line) => {
+    if (busy || !sid.current) return;
+    doing('sending');
+    api(`/session/${sid.current}/message`, { method: 'POST', body: JSON.stringify({ text: line, attachments: [] }) })
+      .catch((e) => { push({ kind: 'notice', text: e.message, error: true }); setWork(null); });
+  };
+
+  const picking = ready && text.startsWith(MODEL_LEAD);
+  const lead = picking ? MODEL_LEAD : '/';
+  const naming = ready && text.startsWith('/') && !text.includes(' ');
+  const typed = text.slice(lead.length).toLowerCase();
+  const matches = picking ? models.filter(m => m.name.toLowerCase().includes(typed))
+    : naming ? commands.filter(c => c.name.toLowerCase().startsWith(typed)) : [];
+  const menuOpen = (matches.length > 0 || (picking && loadingModels)) && !menuOff;
+  const inUse = picking ? matches.findIndex(m => m.name === where.model) : -1;
+  // a list opens on the model in use, and a command typed in full is the one Enter runs
+  const first = picking ? inUse : matches.findIndex(c => c.name.toLowerCase() === typed);
+  const mIdx = menuIndex === null ? Math.max(first, 0) : Math.min(menuIndex, matches.length - 1);
+  const choose = (item) => {
+    const filled = lead + item.name + (picking ? '' : ' ');
+    setText(filled); setMenuOff(!filled.startsWith(MODEL_LEAD)); setMenuIndex(null); if (taRef.current) taRef.current.focus();
+  };
+  const pickModel = () => { setText(MODEL_LEAD); setMenuOff(false); setMenuIndex(null); if (taRef.current) taRef.current.focus(); };
+
+  useEffect(() => {
+    if (!picking) return;
+    setLoadingModels(true);
+    api('/models').then(setModels).catch(() => {}).finally(() => setLoadingModels(false));
+  }, [picking]);
+
+  const onKey = (e) => {
+    if (menuOpen && matches.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setMenuIndex((mIdx + 1) % matches.length); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setMenuIndex((mIdx - 1 + matches.length) % matches.length); return; }
+      if (e.key === 'Tab') { e.preventDefault(); choose(matches[mIdx]); return; }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (lead + matches[mIdx].name + ' ' === MODEL_LEAD) choose(matches[mIdx]);
+        else { setMenuOff(true); send(lead + matches[mIdx].name); }
+        return;
+      }
+      if (e.key === 'Escape') { e.preventDefault(); setMenuOff(true); return; }
+    }
+    if (e.key === 'Escape' && busy) { e.preventDefault(); stop(); return; }
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); }
+  };
+  const grow = (e) => { setText(e.target.value); setMenuOff(false); setMenuIndex(null); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 180) + 'px'; };
+  const chip = 'flex-none px-2 py-0.5 rounded-full border text-xs cursor-pointer ';
+
+  return (
+    <div>
+      <header className="flex items-center gap-3 px-4 py-2.5 border-b border-zinc-800 sticky top-0 bg-[#0b0e14]/95 backdrop-blur z-10">
+        <span className="font-bold tracking-wide text-sky-300 flex-none">Hypersonic</span>
+        <span className="text-zinc-500 text-[13px] truncate hidden md:inline" title={where.cwd}>{where.cwd || (connError ? 'not connected' : 'starting…')}</span>
+        {ready && <span onClick={pickModel} title="Switch model" className={chip + 'border-zinc-700 bg-zinc-900 text-zinc-200 hover:border-sky-500'}>{modelLabel(where.model, where.answered)}</span>}
+        {ready && <span onClick={() => command('/rag')} title="Use your indexed documents. Click to switch on or off."
+          className={chip + (where.rag ? 'border-emerald-600 bg-emerald-950 text-emerald-300' : 'border-zinc-800 text-zinc-500 hover:border-zinc-600')}>{where.rag ? 'rag on' : 'rag off'}</span>}
+        <span className="flex-1" />
+        <Meter usage={usage} />
+        <button onClick={() => startSession(null)} className="flex-none bg-zinc-800 border border-zinc-700 rounded-md px-3 py-1 text-[13px] hover:border-sky-500">New chat</button>
+      </header>
+
+      <main className="max-w-3xl mx-auto px-4 pt-4 pb-52">
+        {connError && (
+          <div className="my-6 rounded-lg border border-red-800 bg-red-950/40 px-4 py-3 text-sm">
+            <div className="text-red-300 font-semibold mb-1">Couldn't connect to Hypersonic</div>
+            <div className="text-zinc-300 whitespace-pre-wrap">{connError}</div>
+            <button onClick={() => startSession(null)} className="mt-3 px-3 py-1 rounded-md bg-zinc-800 border border-zinc-700 text-zinc-100 hover:border-sky-500">Retry</button>
+          </div>
+        )}
+        {!ready && !connError && (
+          <div className="mt-24 text-center text-zinc-500">
+            <div className="mx-auto mb-3 w-6 h-6 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
+            Starting Hypersonic…
+          </div>
+        )}
+        {ready && feed.length === 0 && (
+          <div className="mt-20 text-center text-zinc-400">
+            <div className="text-xl text-zinc-200 mb-3">What should we work on?</div>
+            <div className="text-sm leading-7">
+              <code className="text-sky-400">/</code> shows the commands · <code className="text-sky-400">/rag</code> uses your documents · <code className="text-sky-400">/model</code> switches the model<br />
+              <b className="text-zinc-300">＋</b> attaches images and files · <b className="text-zinc-300">Esc</b> stops a reply
+            </div>
+          </div>
+        )}
+        {feed.map((item, i) => <Row key={i} item={item} version={item.version} onDecide={decide} onResume={startSession} />)}
+        <div ref={endRef} />
+      </main>
+
+      <footer className="fixed inset-x-0 bottom-0 pt-6 pb-4 px-4 bg-gradient-to-t from-[#0b0e14] via-[#0b0e14] to-transparent">
+        {work && <Activity work={work} onStop={stop} />}
+        <div className="max-w-3xl mx-auto bg-[#161b22] border border-zinc-800 rounded-2xl p-2.5 relative focus-within:border-zinc-600">
+          {menuOpen && (
+            <div className="absolute bottom-full left-0 right-0 mb-2 bg-[#161b22] border border-zinc-800 rounded-xl overflow-hidden shadow-xl max-h-72 overflow-y-auto">
+              {matches.length === 0 && <div className="px-3 py-1.5 text-xs text-zinc-500">loading models…</div>}
+              {matches.map((c, i) => (
+                <div key={c.name} ref={i === mIdx ? (row) => row && row.scrollIntoView({ block: 'nearest' }) : null}
+                  onMouseDown={(e) => { e.preventDefault(); picking ? (setMenuOff(true), send(lead + c.name)) : choose(c); }}
+                  className={'flex items-baseline gap-3 px-3 py-1.5 cursor-pointer ' + (i === mIdx ? 'bg-sky-600/30' : 'hover:bg-zinc-800/60')}>
+                  <span className="text-sky-400 font-mono text-sm whitespace-nowrap">{picking ? '' : '/'}{c.name}</span>
+                  <span className="text-zinc-400 text-xs truncate">{c.summary}{i === inUse ? ' · in use' : ''}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-2">
+              {attachments.map((a, i) => (
+                <div key={i} className="relative flex items-center gap-1.5 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1 text-[13px]">
+                  {a.isImage ? <img src={'data:' + a.media_type + ';base64,' + a.data} className="h-8 rounded" /> : <span>📄 {a.name}</span>}
+                  <span onClick={() => setAttachments(x => x.filter((_, j) => j !== i))} className="cursor-pointer text-zinc-500 font-bold">✕</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+            <label title="Attach images or files" className="flex-none w-9 h-9 grid place-items-center bg-zinc-800 border border-zinc-700 rounded-lg text-lg cursor-pointer hover:border-sky-500">
+              ＋<input type="file" multiple hidden onChange={e => { addFiles(e.target.files); e.target.value = ''; }} />
+            </label>
+            <textarea ref={taRef} value={text} onChange={grow} onKeyDown={onKey} rows={1} disabled={!ready} autoFocus
+              placeholder={ready ? 'Message Hypersonic…' : 'Starting Hypersonic, please wait…'}
+              className="flex-1 resize-none bg-transparent outline-none text-[15px] leading-6 py-1.5 max-h-44 placeholder:text-zinc-600 disabled:opacity-60" />
+            {busy
+              ? <button onClick={stop} title="Stop (Esc)" className="flex-none w-9 h-9 grid place-items-center rounded-lg bg-zinc-700 text-white hover:bg-red-600"><span className="w-3 h-3 bg-white rounded-sm" /></button>
+              : <button onClick={send} disabled={!ready} title="Send (Enter)" className="flex-none w-9 h-9 grid place-items-center rounded-lg bg-sky-500 text-white text-lg disabled:opacity-40 disabled:cursor-not-allowed">↑</button>}
+          </div>
+        </div>
+        <div className="max-w-3xl mx-auto mt-1.5 text-xs text-zinc-600">
+          Enter sends · Shift+Enter adds a line · / for commands · images go to the model, other files are saved into the workspace
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

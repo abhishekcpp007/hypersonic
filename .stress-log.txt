@@ -1,0 +1,17 @@
+--- reconnect
+[PASS] reconnect: hanging up frees every one of 200 readers, blocked or not
+[PASS] reconnect: the server keeps no open files for dropped streams (+0)
+[PASS] reconnect: the chat still answers
+--- abort
+[PASS] abort: 25 stops at random moments each end the turn once, within 5s
+[PASS] abort: the chat still answers afterwards
+[PASS] abort: no stopped command is left running
+[PASS] abort: 10 stops in the middle of streamed text
+[PASS] abort: stopping an idle chat is harmless and the history still alternates
+--- crash
+[PASS] crash: after kill -9 a new server starts and the chat resumes
+[PASS] crash: the tool call that was cut off is closed in the history
+[PASS] crash: the command the dead server was running does not live on
+
+11 of 11 checks passed in 33s
+exit: 0

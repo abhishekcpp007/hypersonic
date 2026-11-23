@@ -1,0 +1,52 @@
+{
+  "chunks_indexed": 54,
+  "gold_chunks_missing_from_index": [],
+  "doc": {
+    "recall@1": 0.6571,
+    "recall@3": 0.8571,
+    "recall@5": 0.8571,
+    "mrr": 0.7476
+  },
+  "chunk": {
+    "recall@1": 0.6,
+    "recall@3": 0.8286,
+    "recall@5": 0.8571,
+    "mrr": 0.7152
+  },
+  "chunk_mrr_by_kind": {
+    "factual": 0.875,
+    "identifier": 1.0,
+    "procedural": 0.6875,
+    "semantic": 0.337
+  },
+  "abstain_sweep": {
+    "0.2": {
+      "answerable_refused": 0,
+      "unanswerable_refused": 0
+    },
+    "0.25": {
+      "answerable_refused": 0.0286,
+      "unanswerable_refused": 0.2857
+    },
+    "0.3": {
+      "answerable_refused": 0.0286,
+      "unanswerable_refused": 0.5714
+    },
+    "0.34": {
+      "answerable_refused": 0.1143,
+      "unanswerable_refused": 0.5714
+    },
+    "0.4": {
+      "answerable_refused": 0.2286,
+      "unanswerable_refused": 0.5714
+    },
+    "0.45": {
+      "answerable_refused": 0.2857,
+      "unanswerable_refused": 0.8571
+    },
+    "0.5": {
+      "answerable_refused": 0.3429,
+      "unanswerable_refused": 0.8571
+    }
+  }
+}
